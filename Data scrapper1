@@ -1,0 +1,315 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import random
+from urllib.parse import urljoin, urlparse
+import json
+import csv
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Callable
+import logging
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ScrapedData:
+    """Data structure for scraped content"""
+    url: str
+    title: str
+    content: Dict
+    timestamp: str
+    success: bool
+    error: Optional[str] = None
+
+class WebScraper:
+    """Advanced web scraper with multiple extraction methods"""
+    
+    def __init__(self, delay_range=(1, 3), use_selenium=False, headless=True):
+        self.delay_range = delay_range
+        self.use_selenium = use_selenium
+        self.headless = headless
+        self.session = requests.Session()
+        self.driver = None
+        
+        # Default headers to appear more human-like
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        self.session.headers.update(self.headers)
+        
+        if self.use_selenium:
+            self._setup_selenium()
+    
+    def _setup_selenium(self):
+        """Initialize Selenium WebDriver"""
+        chrome_options = Options()
+        if self.headless:
+            chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument(f'--user-agent={self.headers["User-Agent"]}')
+        
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+            logger.info("Selenium WebDriver initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Selenium: {e}")
+            self.use_selenium = False
+    
+    def _random_delay(self):
+        """Add random delay between requests"""
+        delay = random.uniform(self.delay_range[0], self.delay_range[1])
+        time.sleep(delay)
+    
+    def fetch_page(self, url: str) -> Optional[BeautifulSoup]:
+        """Fetch and parse a web page"""
+        try:
+            if self.use_selenium and self.driver:
+                self.driver.get(url)
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                html = self.driver.page_source
+                return BeautifulSoup(html, 'html.parser')
+            else:
+                response = self.session.get(url, timeout=10)
+                response.raise_for_status()
+                return BeautifulSoup(response.content, 'html.parser')
+                
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            return None
+    
+    def extract_text_content(self, soup: BeautifulSoup) -> Dict:
+        """Extract common text elements from a page"""
+        content = {}
+        
+        # Title
+        title_tag = soup.find('title')
+        content['title'] = title_tag.get_text().strip() if title_tag else ''
+        
+        # Meta description
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        content['meta_description'] = meta_desc.get('content', '') if meta_desc else ''
+        
+        # Headings
+        content['headings'] = {
+            f'h{i}': [h.get_text().strip() for h in soup.find_all(f'h{i}')]
+            for i in range(1, 7)
+        }
+        
+        # Paragraphs
+        paragraphs = soup.find_all('p')
+        content['paragraphs'] = [p.get_text().strip() for p in paragraphs if p.get_text().strip()]
+        
+        # Links
+        links = soup.find_all('a', href=True)
+        content['links'] = [{'text': link.get_text().strip(), 'url': link['href']} 
+                           for link in links if link.get_text().strip()]
+        
+        # Images
+        images = soup.find_all('img', src=True)
+        content['images'] = [{'alt': img.get('alt', ''), 'src': img['src']} for img in images]
+        
+        return content
+    
+    def extract_custom_content(self, soup: BeautifulSoup, selectors: Dict[str, str]) -> Dict:
+        """Extract content using custom CSS selectors"""
+        content = {}
+        
+        for key, selector in selectors.items():
+            try:
+                elements = soup.select(selector)
+                if len(elements) == 1:
+                    content[key] = elements[0].get_text().strip()
+                elif len(elements) > 1:
+                    content[key] = [elem.get_text().strip() for elem in elements]
+                else:
+                    content[key] = None
+            except Exception as e:
+                logger.error(f"Error extracting {key} with selector {selector}: {e}")
+                content[key] = None
+        
+        return content
+    
+    def scrape_url(self, url: str, custom_selectors: Optional[Dict[str, str]] = None) -> ScrapedData:
+        """Scrape a single URL"""
+        logger.info(f"Scraping: {url}")
+        
+        soup = self.fetch_page(url)
+        if not soup:
+            return ScrapedData(
+                url=url, 
+                title="", 
+                content={}, 
+                timestamp=pd.Timestamp.now().isoformat(),
+                success=False,
+                error="Failed to fetch page"
+            )
+        
+        # Extract standard content
+        content = self.extract_text_content(soup)
+        
+        # Extract custom content if selectors provided
+        if custom_selectors:
+            custom_content = self.extract_custom_content(soup, custom_selectors)
+            content['custom'] = custom_content
+        
+        return ScrapedData(
+            url=url,
+            title=content.get('title', ''),
+            content=content,
+            timestamp=pd.Timestamp.now().isoformat(),
+            success=True
+        )
+    
+    def scrape_multiple_urls(self, urls: List[str], custom_selectors: Optional[Dict[str, str]] = None) -> List[ScrapedData]:
+        """Scrape multiple URLs with delays"""
+        results = []
+        
+        for i, url in enumerate(urls):
+            result = self.scrape_url(url, custom_selectors)
+            results.append(result)
+            
+            # Add delay between requests (except for last URL)
+            if i < len(urls) - 1:
+                self._random_delay()
+        
+        return results
+    
+    def save_to_json(self, data: List[ScrapedData], filename: str):
+        """Save scraped data to JSON file"""
+        json_data = []
+        for item in data:
+            json_data.append({
+                'url': item.url,
+                'title': item.title,
+                'content': item.content,
+                'timestamp': item.timestamp,
+                'success': item.success,
+                'error': item.error
+            })
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Data saved to {filename}")
+    
+    def save_to_csv(self, data: List[ScrapedData], filename: str, flatten_content: bool = True):
+        """Save scraped data to CSV file"""
+        rows = []
+        
+        for item in data:
+            row = {
+                'url': item.url,
+                'title': item.title,
+                'timestamp': item.timestamp,
+                'success': item.success,
+                'error': item.error
+            }
+            
+            if flatten_content and item.content:
+                # Flatten some common content fields
+                row['meta_description'] = item.content.get('meta_description', '')
+                row['paragraph_count'] = len(item.content.get('paragraphs', []))
+                row['link_count'] = len(item.content.get('links', []))
+                row['image_count'] = len(item.content.get('images', []))
+                
+                # Add custom content if available
+                if 'custom' in item.content:
+                    for key, value in item.content['custom'].items():
+                        row[f'custom_{key}'] = str(value) if value else ''
+            
+            rows.append(row)
+        
+        df = pd.DataFrame(rows)
+        df.to_csv(filename, index=False, encoding='utf-8')
+        logger.info(f"Data saved to {filename}")
+    
+    def close(self):
+        """Clean up resources"""
+        if self.driver:
+            self.driver.quit()
+        self.session.close()
+
+# Example usage and helper functions
+def scrape_news_articles(urls: List[str]) -> List[ScrapedData]:
+    """Example: Scrape news articles with common selectors"""
+    news_selectors = {
+        'headline': 'h1',
+        'author': '.author, .byline, [data-author]',
+        'publish_date': '.date, .publish-date, time',
+        'article_body': '.article-body, .content, .post-content'
+    }
+    
+    scraper = WebScraper(delay_range=(2, 4))
+    try:
+        results = scraper.scrape_multiple_urls(urls, news_selectors)
+        return results
+    finally:
+        scraper.close()
+
+def scrape_product_listings(urls: List[str]) -> List[ScrapedData]:
+    """Example: Scrape e-commerce product pages"""
+    product_selectors = {
+        'product_name': 'h1, .product-title',
+        'price': '.price, .cost, [data-price]',
+        'description': '.description, .product-description',
+        'rating': '.rating, .stars, .review-score',
+        'availability': '.stock, .availability'
+    }
+    
+    scraper = WebScraper(delay_range=(3, 6))
+    try:
+        results = scraper.scrape_multiple_urls(urls, product_selectors)
+        return results
+    finally:
+        scraper.close()
+
+def scrape_with_javascript(urls: List[str]) -> List[ScrapedData]:
+    """Example: Scrape JavaScript-heavy sites using Selenium"""
+    scraper = WebScraper(use_selenium=True, delay_range=(2, 4))
+    try:
+        results = scraper.scrape_multiple_urls(urls)
+        return results
+    finally:
+        scraper.close()
+
+# Main execution example
+if __name__ == "__main__":
+    # Example usage
+    urls_to_scrape = [
+        "https://example.com/page1",
+        "https://example.com/page2",
+        "https://example.com/page3"
+    ]
+    
+    # Basic scraping
+    scraper = WebScraper()
+    try:
+        results = scraper.scrape_multiple_urls(urls_to_scrape)
+        
+        # Save results
+        scraper.save_to_json(results, "scraped_data.json")
+        scraper.save_to_csv(results, "scraped_data.csv")
+        
+        # Print summary
+        successful = sum(1 for r in results if r.success)
+        print(f"Scraping completed: {successful}/{len(results)} successful")
+        
+    finally:
+        scraper.close()
